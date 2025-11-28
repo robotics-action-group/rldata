@@ -158,6 +158,8 @@ class RLData():
             for key in modality.modality_keys:
                 if key not in processed_obs[modality_label]:
                     raise ValueError(f"Processed observations missing key: {key} in modality: {modality_label}")
+                processed_obs[modality_label][key] = processed_obs[modality_label][key].cpu()
+        # print("Processed observation keys: ", processed_obs.keys())
         self.replay_buffer.extend(processed_obs)
 
     def toGR00T(self):
@@ -256,10 +258,10 @@ class RLData():
         for frame in video_data:
             frame_np = frame.cpu().numpy()
             if frame_np.dtype != 'uint8':
-                if frame_np.max() <= 1.0:
-                    frame_np = (frame_np * 255).clip(0, 255).astype('uint8')
-                else:
-                    frame_np = frame_np.astype('uint8')
+                # if frame_np.max() <= 1.0: # TODO: why dark image, triggers this if condition
+                frame_np = (frame_np * 255).clip(0, 255).astype('uint8')
+                # else:
+                #     frame_np = frame_np.astype('uint8')
             frames.append(frame_np)
         imageio.mimsave(gif_path, frames, fps=fps)
 

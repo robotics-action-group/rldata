@@ -29,6 +29,15 @@ class RLDataDistributed(RLData):
         else:   
             dist.init_process_group("gloo", rank=self.rank, world_size=world_size, init_method='tcp://10.5.0.2:8000')
     
+    def shutdown(self):
+        """
+        Shutdown the distributed process group.
+        
+        This method is called to clean up the distributed environment.
+        """
+        dist.destroy_process_group()
+        print("[INFO] Distributed process group destroyed.")
+    
     def sendBufferToAgent(self):
         """
         Send the data to the agent.        
