@@ -1,4 +1,15 @@
+"""RLData - A Python package for robot learning dataset handling.
 
-from .base import RLData
-from .distributed import RLDataDistributed
-from .modality import ModalityConfig
+This package provides utilities for loading and handling robot learning datasets,
+with support for the OXE (Open X-Embodiment) dataset collection from Google Cloud.
+"""
+
+from rldata.oxe_dataset import OXEDataset, dataset2path
+
+__all__ = [
+    'OXEDataset',
+    'dataset2path',
+]
+
+__version__ = '0.1.0'
+__author__ = 'Robotics Action Group'

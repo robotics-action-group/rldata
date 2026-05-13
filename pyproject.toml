@@ -7,13 +7,30 @@ name = "rldata"
 version = "0.1.0"
 description = "A Python package for RL data handling."
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Robotics Action Group", email = "robotics-action-group@example.com" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent"
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+    "tensorflow-datasets>=4.8.2",
+    "torch>=1.13.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/robotics-action-group/rldata"
+Repository = "https://github.com/robotics-action-group/rldata.git"
+
