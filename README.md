@@ -19,7 +19,7 @@ A Python package for loading and handling robot learning datasets, with support 
 ### Using pip
 
 ```bash
-pip install rldata
+pip install "rldata[oxe]"
 ```
 
 ### From source
@@ -27,15 +27,15 @@ pip install rldata
 ```bash
 git clone https://github.com/robotics-action-group/rldata.git
 cd rldata
-pip install -e .
+pip install -e ".[oxe]"
 ```
 
 ### Requirements
 
 - Python >= 3.7
 - PyTorch >= 1.13.1
-- TensorFlow Datasets >= 4.8.2
 - NumPy
+- TensorFlow >= 2.11.1 and TensorFlow Datasets >= 4.8.2 (required for OXE loading)
 
 ## Quick Start
 
