@@ -7,7 +7,7 @@ name = "rldata"
 version = "0.1.0"
 description = "A Python package for RL data handling."
 authors = [
-    { name = "Robotics Action Group", email = "robotics-action-group@example.com" }
+    { name = "Robotics Action Group", email = "vaishnavahari.seenivasan@rwth-aachen.de" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
@@ -26,8 +26,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "tensorflow-datasets>=4.8.2",
+    "numpy>=1.21.6",
     "torch>=1.13.1",
+]
+
+[project.optional-dependencies]
+oxe = [
+    "tensorflow>=2.11.1",
+    "tensorflow-datasets>=4.8.2",
+    "tqdm>=4.64.0",
 ]
 
 [project.urls]

@@ -4,13 +4,19 @@ setup(
     name="rldata",
     version="0.1.0",
     description="A Python package for RL data handling.",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="Vaishnavahari Seenivasan",
+    author_email="vaishnavahari.seenivasan@rwth-aachen.de",
     packages=find_packages(),
     install_requires=[
-        "tensorflow-datasets>=4.8.2",
+        "numpy>=1.21.6",
         "torch>=1.13.1",
     ],
+    extras_require={
+        "oxe": [
+            "tensorflow>=2.11.1",
+            "tensorflow-datasets>=4.8.2",
+        ],
+    },
     python_requires=">=3.7",
     license="MIT",
     url="https://github.com/robotics-action-group/rldata",
