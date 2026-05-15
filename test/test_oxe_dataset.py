@@ -4,9 +4,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tensordict import TensorDict
 
 import rldata.oxe_dataset as oxe
-from rldata.oxe.utils import tf_to_torch
+from rldata.oxe.utils import dict_to_tensordict, episode_to_ted_steps, tf_to_torch
 
 
 # ---------------------------------------------------------------------------
@@ -15,17 +16,28 @@ from rldata.oxe.utils import tf_to_torch
 
 _FAKE_CACHE = {"droid": {"1.0.1": "gs://gresearch/robotics/droid/1.0.1"}}
 
-_EPISODES = [
-    {
-        "observation": {
-            "image": np.zeros((8, 8, 3), dtype=np.uint8),
-            "state": np.array([float(i)] * 4, dtype=np.float32),
-        },
-        "action": np.array([float(i), float(i)], dtype=np.float32),
-        "language_instruction": b"pick up the block",
-    }
-    for i in range(5)
-]
+# Each "episode" is a dict with a "steps" key, mirroring the real TFDS OXE format.
+# Each step contains obs, action, reward, termination flags, and a text instruction.
+def _make_episode(episode_idx: int, n_steps: int = 3) -> dict:
+    steps = []
+    for t in range(n_steps):
+        steps.append(
+            {
+                "observation": {
+                    "image": np.zeros((8, 8, 3), dtype=np.uint8),
+                    "state": np.array([float(episode_idx)] * 4, dtype=np.float32),
+                },
+                "action": np.array([float(episode_idx), float(t)], dtype=np.float32),
+                "reward": np.float32(float(t)),
+                "is_last": np.bool_(t == n_steps - 1),
+                "is_terminal": np.bool_(t == n_steps - 1),
+                "language_instruction": b"pick up the block",
+            }
+        )
+    return {"steps": steps}
+
+
+_EPISODES = [_make_episode(i) for i in range(5)]
 
 
 class FakeDataset:
@@ -48,7 +60,7 @@ class FakeDataset:
 class FakeInfo:
     description = "fake"
 
-    def __init__(self, episodes):
+    def __init__(self):
         self.features = {
             "observation": {
                 "image": np.zeros((8, 8, 3), dtype=np.uint8),
@@ -57,12 +69,12 @@ class FakeInfo:
             "action": np.zeros((2,), dtype=np.float32),
             "language_instruction": b"pick up the block",
         }
-        self.splits = {"train": SimpleNamespace(num_examples=len(episodes))}
+        self.splits = {"train": SimpleNamespace(num_examples=len(_EPISODES))}
 
 
 class FakeBuilder:
     def __init__(self, episodes):
-        self.info = FakeInfo(episodes)
+        self.info = FakeInfo()
         self.meta = self.info.features
         self._episodes = episodes
 
@@ -73,13 +85,13 @@ class FakeBuilder:
 def _patch(monkeypatch: pytest.MonkeyPatch, episodes=None):
     eps = episodes if episodes is not None else _EPISODES
     fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
-    fake_tfds = SimpleNamespace(builder_from_directory=lambda builder_dir: FakeBuilder(eps))
+    fake_tfds = SimpleNamespace(builder_from_directory=lambda **kw: FakeBuilder(eps))
     monkeypatch.setattr(oxe, "tf", fake_tf, raising=False)
     monkeypatch.setattr(oxe, "tfds", fake_tfds, raising=False)
     monkeypatch.setattr(oxe, "_TF_TENSOR_TYPES", tuple(), raising=False)
     monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
-    # Bypass GCS download; builder_from_directory is already mocked above
     monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: None)
+    monkeypatch.setattr(oxe, "_copy_metadata_only", lambda src, dst: None)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +138,83 @@ def test_tf_to_torch_nested_dict() -> None:
 
 
 # ---------------------------------------------------------------------------
+# dict_to_tensordict
+# ---------------------------------------------------------------------------
+
+def test_dict_to_tensordict_tensors() -> None:
+    data = {
+        "action": torch.tensor([1.0, 2.0]),
+        "observation": {"image": torch.zeros(8, 8, 3, dtype=torch.uint8)},
+    }
+    td = dict_to_tensordict(data)
+    assert isinstance(td, TensorDict)
+    assert isinstance(td["action"], torch.Tensor)
+    assert isinstance(td["observation"], TensorDict)
+    assert td["observation"]["image"].shape == (8, 8, 3)
+
+
+def test_dict_to_tensordict_non_tensor() -> None:
+    data = {"action": torch.tensor([0.0]), "language_instruction": "go left"}
+    td = dict_to_tensordict(data)
+    assert isinstance(td, TensorDict)
+    assert td.get_non_tensor("language_instruction") == "go left"
+
+
+# ---------------------------------------------------------------------------
+# episode_to_ted_steps
+# ---------------------------------------------------------------------------
+
+def test_episode_to_ted_steps_basic() -> None:
+    episode = _make_episode(0, n_steps=3)
+    steps = episode_to_ted_steps(episode, episode_idx=0)
+    assert len(steps) == 3
+    for td in steps:
+        assert isinstance(td, TensorDict)
+        assert "observation" in td.keys()
+        assert "action" in td.keys()
+        assert "done" in td.keys()
+        assert "terminated" in td.keys()
+        assert "next" in td.keys()
+        assert "observation" in td["next"].keys()
+        assert "reward" in td["next"].keys()
+
+
+def test_episode_to_ted_steps_last_step_done() -> None:
+    episode = _make_episode(0, n_steps=2)
+    steps = episode_to_ted_steps(episode, episode_idx=0)
+    assert steps[-1]["done"].item() is True
+    assert steps[0]["done"].item() is False
+
+
+def test_episode_to_ted_steps_traj_ids() -> None:
+    episode = _make_episode(0, n_steps=2)
+    steps = episode_to_ted_steps(episode, episode_idx=7)
+    for td in steps:
+        assert td["collector", "traj_ids"].item() == 7
+
+
+def test_episode_to_ted_steps_next_obs_for_non_terminal() -> None:
+    """next/observation at step t should equal observation at step t+1."""
+    episode = _make_episode(0, n_steps=3)
+    steps = episode_to_ted_steps(episode, episode_idx=0)
+    # action[t] encodes episode_idx and step t, so obs state value is episode_idx
+    assert torch.allclose(
+        steps[0]["next", "observation", "state"],
+        steps[1]["observation", "state"],
+    )
+
+
+def test_episode_to_ted_steps_flat_format() -> None:
+    """Flat episode dict (no 'steps' key) is treated as a single-step episode."""
+    episode = {
+        "observation": {"state": np.array([1.0, 2.0], dtype=np.float32)},
+        "action": np.array([0.5], dtype=np.float32),
+    }
+    steps = episode_to_ted_steps(episode, episode_idx=0)
+    assert len(steps) == 1
+
+
+# ---------------------------------------------------------------------------
 # list_datasets / validate / dataset2path
 # ---------------------------------------------------------------------------
 
@@ -167,72 +256,184 @@ def test_get_cache_dir_override(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OXEDataset — basic construction and iteration
+# OXEDataset — construction and ReplayBuffer API
 # ---------------------------------------------------------------------------
 
-def test_strip_trailing_slash(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_strip_trailing_slash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid/", split="train")
+    ds = oxe.OXEDataset(dataset_name="droid/", split="train", root=str(tmp_path))
     assert ds.dataset_name == "droid"
 
 
-def test_iter_converts_to_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dataset_has_correct_step_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """5 episodes × 3 steps each = 15 total steps in the buffer."""
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train")
-    sample = next(iter(ds))
-    # Numeric arrays → torch.Tensor
-    assert isinstance(sample["action"], torch.Tensor)
-    assert sample["action"].shape == (2,)
-    assert isinstance(sample["observation"]["image"], torch.Tensor)
-    assert isinstance(sample["observation"]["state"], torch.Tensor)
-    # Byte string → decoded str (cannot be a tensor)
-    assert isinstance(sample["language_instruction"], str)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert len(ds) == 15  # 5 episodes × 3 steps
 
 
-def test_iter_all_episodes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sample_returns_tensordict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train")
-    results = list(ds)
-    assert len(results) == 5
-    for i, ep in enumerate(results):
-        assert ep["action"][0].item() == pytest.approx(float(i))
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=4, root=str(tmp_path))
+    batch = ds.sample()
+    assert isinstance(batch, TensorDict)
+    assert batch.batch_size[0] == 4
 
 
-def test_getitem(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sample_has_ted_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train")
-    ep = ds[2]
-    assert isinstance(ep["action"], torch.Tensor)
-    assert ep["action"][0].item() == pytest.approx(2.0)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=2, root=str(tmp_path))
+    batch = ds.sample()
+    assert "observation" in batch.keys()
+    assert "action" in batch.keys()
+    assert "done" in batch.keys()
+    assert "next" in batch.keys()
+    assert "observation" in batch["next"].keys()
+    assert "reward" in batch["next"].keys()
 
-    with pytest.raises(IndexError):
-        ds[99]
+
+def test_sample_action_is_tensor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=3, root=str(tmp_path))
+    batch = ds.sample()
+    assert isinstance(batch["action"], torch.Tensor)
+    assert batch["action"].shape == (3, 2)
+
+
+def test_sample_observation_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=2, root=str(tmp_path))
+    batch = ds.sample()
+    assert batch["observation", "image"].shape == (2, 8, 8, 3)
+    assert batch["observation", "image"].dtype == torch.uint8
 
 
 # ---------------------------------------------------------------------------
 # OXEDataset — episodes filter
 # ---------------------------------------------------------------------------
 
-def test_episodes_filters_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_num_episodes_property(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 2, 4])
-    results = list(ds)
-    assert len(results) == 3
-    assert results[0]["action"][0].item() == pytest.approx(0.0)
-    assert results[1]["action"][0].item() == pytest.approx(2.0)
-    assert results[2]["action"][0].item() == pytest.approx(4.0)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert ds.num_episodes == 5
 
 
-def test_episodes_single(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_base_dataset_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from torchrl.data.datasets.common import BaseDatasetExperienceReplay
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[3])
-    results = list(ds)
-    assert len(results) == 1
-    assert results[0]["action"][0].item() == pytest.approx(3.0)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert isinstance(ds, BaseDatasetExperienceReplay)
+    assert ds.data_path.name == "tensors"
+    assert ds.data_path_root == tmp_path / "oxe" / "droid"
+    assert ds._is_downloaded() is True
+
+
+def test_episodes_filter_reduces_step_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """episodes=[0, 1] → 2 episodes × 3 steps = 6 steps."""
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path)
+    )
+    assert len(ds) == 6
+
+
+def test_episodes_single(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid", split="train", episodes=[2], root=str(tmp_path)
+    )
+    assert len(ds) == 3  # 1 episode × 3 steps
 
 
 # ---------------------------------------------------------------------------
-# OXEDataset — local cache
+# OXEDataset — memmap caching
+# ---------------------------------------------------------------------------
+
+def test_memmap_sentinel_created(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    sentinel = ds._memmap_dir() / "_complete.json"
+    assert sentinel.exists()
+    meta = __import__("json").loads(sentinel.read_text())
+    assert meta["n_steps"] == 15
+    assert meta["n_episodes"] == 5
+
+
+def test_memmap_reused_on_second_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """build_memmap should not be called a second time if sentinel exists."""
+    _patch(monkeypatch)
+    from rldata.oxe import memmap_builder as mb
+
+    calls = []
+    original = mb.build_memmap
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(oxe, "build_memmap", spy)
+
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert len(calls) == 1
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert len(calls) == 1  # not called again
+
+
+def test_full_download_when_no_episodes_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """episodes=None → metadata + full shards downloaded via _copy_tree."""
+    eps = _EPISODES
+    fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
+    fake_tfds = SimpleNamespace(builder_from_directory=lambda **kw: FakeBuilder(eps))
+    monkeypatch.setattr(oxe, "tf", fake_tf, raising=False)
+    monkeypatch.setattr(oxe, "tfds", fake_tfds, raising=False)
+    monkeypatch.setattr(oxe, "_TF_TENSOR_TYPES", tuple(), raising=False)
+    monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
+
+    tree_calls, meta_calls = [], []
+    monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
+    monkeypatch.setattr(oxe, "_copy_metadata_only", lambda src, dst: meta_calls.append(src))
+
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert meta_calls == ["gs://gresearch/robotics/droid/1.0.1"], "_copy_metadata_only always runs"
+    assert tree_calls == ["gs://gresearch/robotics/droid/1.0.1"], "_copy_tree runs for full download"
+
+
+def test_metadata_only_download_when_episodes_given(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """episodes=[0,1] → only metadata downloaded; _copy_tree never called."""
+    eps = _EPISODES
+    fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
+    fake_tfds = SimpleNamespace(builder_from_directory=lambda **kw: FakeBuilder(eps))
+    monkeypatch.setattr(oxe, "tf", fake_tf, raising=False)
+    monkeypatch.setattr(oxe, "tfds", fake_tfds, raising=False)
+    monkeypatch.setattr(oxe, "_TF_TENSOR_TYPES", tuple(), raising=False)
+    monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
+
+    tree_calls, meta_calls = [], []
+    monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
+    monkeypatch.setattr(oxe, "_copy_metadata_only", lambda src, dst: meta_calls.append(src))
+
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    assert tree_calls == [], "_copy_tree must not be called when episodes are specified"
+    assert meta_calls == ["gs://gresearch/robotics/droid/1.0.1"]
+
+
+def test_copy_tree_skipped_when_memmap_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Once the TED memmap is built, _copy_tree is never called again (metadata only)."""
+    _patch(monkeypatch)
+
+    tree_calls = []
+    monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
+
+    # First init builds the memmap
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    # Second init: memmap complete → no _copy_tree
+    tree_calls.clear()
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert tree_calls == [], "_copy_tree must not run when TED memmap is already complete"
+
+
+# ---------------------------------------------------------------------------
+# OXEDataset — local cache dir helpers
 # ---------------------------------------------------------------------------
 
 def test_local_tfds_dir_default_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -247,51 +448,20 @@ def test_local_tfds_dir_with_version(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert ds._local_tfds_dir() == tmp_path / "oxe" / "droid" / "1.0.1"
 
 
-def test_copy_tree_called_when_not_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    eps = _EPISODES
-    fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
-    fake_tfds = SimpleNamespace(builder_from_directory=lambda builder_dir: FakeBuilder(eps))
-    monkeypatch.setattr(oxe, "tf", fake_tf, raising=False)
-    monkeypatch.setattr(oxe, "tfds", fake_tfds, raising=False)
-    monkeypatch.setattr(oxe, "_TF_TENSOR_TYPES", tuple(), raising=False)
-    monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
-
-    calls = []
-    monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: calls.append((src, dst)))
-
-    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert len(calls) == 1
-    assert calls[0][0] == "gs://gresearch/robotics/droid/1.0.1"
-
-
-def test_copy_tree_skipped_when_already_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _patch(monkeypatch)
-    # Pre-create the local TFDS dir with a valid (non-empty) dataset_info.json
-    local_dir = tmp_path / "oxe" / "droid"
-    local_dir.mkdir(parents=True)
-    (local_dir / "dataset_info.json").write_text("{}")
-
-    calls = []
-    monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: calls.append((src, dst)))
-
-    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert len(calls) == 0
-
-
 # ---------------------------------------------------------------------------
 # Modalities and dataset info
 # ---------------------------------------------------------------------------
 
-def test_modalities_from_builder_meta(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_modalities_from_builder_meta(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train")
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
     mods = ds.get_modalities()
     assert mods["observation/image"]["kind"] == "image"
     assert mods["action"]["kind"] == "action"
 
 
-def test_get_dataset_info(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_dataset_info(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch(monkeypatch)
-    ds = oxe.OXEDataset(dataset_name="droid", split="train")
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
     info = ds.get_dataset_info()
     assert info["description"] == "fake"
