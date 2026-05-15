@@ -520,3 +520,66 @@ def test_get_dataset_info(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
     info = ds.get_dataset_info()
     assert info["description"] == "fake"
+
+
+# ---------------------------------------------------------------------------
+# Combined memmap (memory-safe storage)
+# ---------------------------------------------------------------------------
+
+def test_combined_storage_sentinel_created(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """After first init, the combined memmap sentinel _complete.json must exist."""
+    import json as _json
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    combined_dir = ds._combined_dir([0, 1])
+    sentinel = combined_dir / "_complete.json"
+    assert sentinel.exists(), "_complete.json sentinel missing after first init"
+    meta = _json.loads(sentinel.read_text())
+    assert meta["n_steps"] == 6  # 2 episodes × 3 steps
+    assert meta["episodes"] == [0, 1]
+
+
+def test_combined_storage_not_rebuilt_on_second_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """build_combined_storage must not be called when the combined memmap already exists."""
+    _patch(monkeypatch)
+    from rldata.oxe import memmap_builder as mb
+
+    calls: list = []
+    original = mb.build_combined_storage
+
+    def spy(*a, **kw):
+        calls.append(True)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(oxe, "build_combined_storage", spy)
+
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    assert len(calls) == 1
+
+    calls.clear()
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    assert calls == [], "build_combined_storage must not be called when combined storage is complete"
+
+
+def test_different_episode_lists_get_separate_combined_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two OXEDataset instances with different episode lists get distinct combined dirs."""
+    _patch(monkeypatch)
+    ds1 = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    ds2 = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path))
+    assert ds1._combined_dir([0, 1]) != ds2._combined_dir([0, 1, 2])
+    assert ds1._combined_dir([0, 1]).exists()
+    assert ds2._combined_dir([0, 1, 2]).exists()
+
+
+def test_combined_storage_is_memory_mapped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Tensor leaves in the combined storage must be MemoryMappedTensor, not plain Tensors."""
+    from tensordict.memmap import MemoryMappedTensor
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    storage_td = ds._storage._storage
+    assert isinstance(storage_td["action"], MemoryMappedTensor), (
+        "action leaf should be MemoryMappedTensor (lazy disk access), got "
+        f"{type(storage_td['action']).__name__}"
+    )

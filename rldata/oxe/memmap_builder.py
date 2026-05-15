@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, List, Set, Tuple
@@ -14,6 +15,7 @@ except ImportError:
     _tqdm_cls = None  # type: ignore[assignment]
 
 _EPISODE_SENTINEL = "_steps.json"
+_COMBINED_SENTINEL = "_complete.json"
 
 
 def is_episode_cached(episode_dir: Path) -> bool:
@@ -92,3 +94,80 @@ def build_missing_episodes(
 
     if pbar is not None:
         pbar.close()
+
+
+# ---------------------------------------------------------------------------
+# Combined memmap (memory-safe concatenation of per-episode stores)
+# ---------------------------------------------------------------------------
+
+def combined_dir_key(selected: List[int]) -> str:
+    """Stable 16-char hex hash of the sorted episode list — used as dir name."""
+    payload = ",".join(str(i) for i in sorted(selected))
+    return hashlib.md5(payload.encode()).hexdigest()[:16]
+
+
+def is_combined_complete(combined_dir: Path) -> bool:
+    """Return True if the combined memmap has been fully built."""
+    return (combined_dir / _COMBINED_SENTINEL).exists()
+
+
+def build_combined_storage(
+    selected: List[int],
+    episodes_dir: Path,
+    combined_dir: Path,
+) -> None:
+    """Concatenate per-episode memmaps into a single combined memmap.
+
+    Only one episode is loaded into RAM at a time (peak RAM = one episode).
+    Tensor leaves are stored as MemoryMappedTensor; non-tensor leaves
+    (e.g. language_instruction strings) are stored via tensordict's pickle
+    mechanism — both survive ``TensorDict.load_memmap`` on subsequent inits.
+
+    Args:
+        selected: Sorted list of episode indices to combine.
+        episodes_dir: Root directory containing per-episode subdirs.
+        combined_dir: Destination directory (``data/`` subdir created inside).
+    """
+    from tensordict import TensorDict
+
+    n_steps_map = {
+        i: json.loads((episodes_dir / str(i) / _EPISODE_SENTINEL).read_text())["n_steps"]
+        for i in selected
+    }
+    total_steps = sum(n_steps_map.values())
+
+    data_dir = combined_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load one row from the first episode to get the schema, then pre-allocate
+    # a memmap of shape [total_steps] with the same structure (all zeros/proto vals).
+    proto = TensorDict.load_memmap(str(episodes_dir / str(selected[0])))[:1]
+    combined = proto.expand(total_steps).memmap_like(str(data_dir))
+
+    pbar = (
+        _tqdm_cls(
+            total=len(selected),
+            desc="Assembling training buffer",
+            unit="ep",
+            dynamic_ncols=True,
+        )
+        if _tqdm_cls is not None
+        else None
+    )
+
+    offset = 0
+    for i in selected:
+        ep_td = TensorDict.load_memmap(str(episodes_dir / str(i)))
+        n = n_steps_map[i]
+        combined[offset : offset + n] = ep_td
+        offset += n
+        del ep_td
+        if pbar is not None:
+            pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
+
+    (combined_dir / _COMBINED_SENTINEL).write_text(
+        json.dumps({"n_steps": total_steps, "episodes": sorted(selected)})
+    )

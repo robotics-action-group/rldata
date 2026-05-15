@@ -11,13 +11,18 @@ try:
 except ImportError:
     _tqdm_cls = None  # type: ignore[assignment]
 
-import torch
 from tensordict import TensorDict
 from torchrl.data import ImmutableDatasetWriter, RandomSampler, SliceSampler, TensorStorage
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
-from rldata.oxe.memmap_builder import build_missing_episodes, is_episode_cached
+from rldata.oxe.memmap_builder import (
+    build_combined_storage,
+    build_missing_episodes,
+    combined_dir_key,
+    is_combined_complete,
+    is_episode_cached,
+)
 from rldata.oxe.utils import (
     ModalitySpec,
     flatten_structure,
@@ -383,11 +388,14 @@ class OXEDataset(BaseDatasetExperienceReplay):
             )
 
         # ------------------------------------------------------------------
-        # 4. Load per-episode memmaps and concatenate (lazy — no data copied)
+        # 4. Build (or reuse) the combined memmap, then load it lazily.
+        #    Peak RAM during build = one episode; during training = batch_size.
         # ------------------------------------------------------------------
         self._loaded_indices: List[int] = selected
-        episode_tds = [TensorDict.load_memmap(str(episodes_dir / str(i))) for i in selected]
-        combined_td = torch.cat(episode_tds)
+        combined_dir = self._combined_dir(selected)
+        if not is_combined_complete(combined_dir):
+            build_combined_storage(selected, episodes_dir, combined_dir)
+        combined_td = TensorDict.load_memmap(str(combined_dir / "data"))
         storage = TensorStorage(combined_td)
 
         if slice_len is not None:
@@ -438,6 +446,10 @@ class OXEDataset(BaseDatasetExperienceReplay):
 
     def _episodes_dir(self) -> Path:
         return self._local_tfds_dir() / "episodes" / self.split
+
+    def _combined_dir(self, selected: List[int]) -> Path:
+        key = combined_dir_key(selected)
+        return self._local_tfds_dir() / "combined" / self.split / key
 
     def _get_total_episodes(self) -> int:
         """Return total episode count for the current split from builder.info."""
