@@ -1,4 +1,4 @@
-We need a class OXEDataset(torch.utils.data.IterativeDataset) that can load data for specific dataset part of the oxe gcloud bucket.
+We need a class OXEDataset(torchrl.data.datasets.common.BaseDatasetExperienceReplay) that can load data for specific dataset part of the oxe gcloud bucket.
 
 REMEMBER AGENT.md is the entrypoint for the agent.
 
@@ -17,4 +17,10 @@ For example in output I want to see, name: viola and versions [0.1.0]
 
 5. After Downloading, use builder.meta to get all the modalities for in any episode. Remember, modalities change from datatset to dataset, so we need to be able to handle that.
 
-6. tf tensor to torch tensor conversion. Do it only at the __iter__ method. First convert tf tensor to numpy and then to torch tensor. Remeber it has to efficient and memory safe. Do not convert the entire dataset to torch tensor at once, do it on the fly when iterating through the dataset. Dont use or move to cuda or gpu device anywhere in the Dataset.
+6. tf tensor to torch tensor conversion. 
+
+- Load tlds on episodes in previously specified episodes list or all episodes if episodes list is not given. Convert all those episodes into torchrl TED format in one go. They can be held in a suitable memmap according to guidlines provided by torchrl. Make use of torchrl storage libs effectively.
+
+- First convert tf tensor to numpy and then to torch tensor. Remember it has to efficient and memory safe.  Dont use or move to cuda or gpu device anywhere in the Dataset.
+
+- Modalitites can be different for different datasets, so we need to be able to handle that. Names of modalities and their shapes can be different for different datasets. Also there would be a modality with str type, that too should be part of the TensorDict. 
