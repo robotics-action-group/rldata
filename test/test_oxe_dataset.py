@@ -323,7 +323,7 @@ def test_base_dataset_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     _patch(monkeypatch)
     ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
     assert isinstance(ds, BaseDatasetExperienceReplay)
-    assert ds.data_path.name == "tensors"
+    assert ds.data_path == tmp_path / "oxe" / "droid" / "episodes" / "train"
     assert ds.data_path_root == tmp_path / "oxe" / "droid"
     assert ds._is_downloaded() is True
 
@@ -346,41 +346,74 @@ def test_episodes_single(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# OXEDataset — memmap caching
+# OXEDataset — per-episode caching
 # ---------------------------------------------------------------------------
 
-def test_memmap_sentinel_created(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_per_episode_sentinels_created(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Each episode gets its own _steps.json sentinel under episodes/train/{i}/."""
+    import json as _json
     _patch(monkeypatch)
     ds = oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    sentinel = ds._memmap_dir() / "_complete.json"
-    assert sentinel.exists()
-    meta = __import__("json").loads(sentinel.read_text())
-    assert meta["n_steps"] == 15
-    assert meta["n_episodes"] == 5
+    episodes_dir = ds._episodes_dir()
+    for i in range(5):
+        sentinel = episodes_dir / str(i) / "_steps.json"
+        assert sentinel.exists(), f"sentinel missing for episode {i}"
+        meta = _json.loads(sentinel.read_text())
+        assert meta["n_steps"] == 3  # 3 steps per episode in fake data
 
 
-def test_memmap_reused_on_second_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """build_memmap should not be called a second time if sentinel exists."""
+def test_no_rebuild_on_same_episodes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Second init with the same episodes calls build_missing_episodes 0 times."""
     _patch(monkeypatch)
     from rldata.oxe import memmap_builder as mb
 
     calls = []
-    original = mb.build_memmap
+    original = mb.build_missing_episodes
 
     def spy(*a, **kw):
-        calls.append(1)
+        calls.append(kw.get("missing", a[3] if len(a) > 3 else []))
         return original(*a, **kw)
 
-    monkeypatch.setattr(oxe, "build_memmap", spy)
+    monkeypatch.setattr(oxe, "build_missing_episodes", spy)
 
-    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert len(calls) == 1
-    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert len(calls) == 1  # not called again
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path))
+    assert len(calls) == 1 and calls[0] == [0, 1, 2]
+
+    calls.clear()
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path))
+    assert calls == [], "build_missing_episodes must not be called when all episodes are cached"
+
+
+def test_incremental_reuse_across_episode_lists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Second init with a superset only builds the new episodes, reuses the rest."""
+    _patch(monkeypatch)
+    from rldata.oxe import memmap_builder as mb
+
+    built: list = []
+    original = mb.build_missing_episodes
+
+    def spy(*a, **kw):
+        missing = kw.get("missing", a[3] if len(a) > 3 else [])
+        built.extend(missing)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(oxe, "build_missing_episodes", spy)
+
+    # First init: episodes 0 and 2
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 2], root=str(tmp_path))
+    assert sorted(built) == [0, 2]
+
+    built.clear()
+    # Second init: episodes 0, 1, 2 — only episode 1 should be built
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path))
+    assert built == [1], f"expected only episode 1 to be built, got {built}"
+    assert len(oxe.OXEDataset(
+        dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path)
+    )) == 9  # 3 episodes × 3 steps
 
 
 def test_full_download_when_no_episodes_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """episodes=None → metadata + full shards downloaded via _copy_tree."""
+    """episodes=None → metadata downloaded once, then full shards via _copy_tree."""
     eps = _EPISODES
     fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
     fake_tfds = SimpleNamespace(builder_from_directory=lambda **kw: FakeBuilder(eps))
@@ -390,16 +423,29 @@ def test_full_download_when_no_episodes_filter(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
 
     tree_calls, meta_calls = [], []
+
+    def _fake_copy_metadata(src, dst):
+        meta_calls.append(src)
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / "dataset_info.json").write_text("{}")
+
     monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
-    monkeypatch.setattr(oxe, "_copy_metadata_only", lambda src, dst: meta_calls.append(src))
+    monkeypatch.setattr(oxe, "_copy_metadata_only", _fake_copy_metadata)
 
     oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert meta_calls == ["gs://gresearch/robotics/droid/1.0.1"], "_copy_metadata_only always runs"
+    assert meta_calls == ["gs://gresearch/robotics/droid/1.0.1"], "_copy_metadata_only runs on first init"
     assert tree_calls == ["gs://gresearch/robotics/droid/1.0.1"], "_copy_tree runs for full download"
+
+    # Second init: dataset_info.json now exists locally — no GCS calls
+    meta_calls.clear()
+    tree_calls.clear()
+    oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
+    assert meta_calls == [], "_copy_metadata_only must not run when metadata already present"
+    assert tree_calls == [], "_copy_tree must not run when all episodes already cached"
 
 
 def test_metadata_only_download_when_episodes_given(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """episodes=[0,1] → only metadata downloaded; _copy_tree never called."""
+    """episodes=[0,1] → only metadata downloaded on first init; _copy_tree never called."""
     eps = _EPISODES
     fake_tf = SimpleNamespace(Tensor=np.ndarray, io=SimpleNamespace(gfile=SimpleNamespace()))
     fake_tfds = SimpleNamespace(builder_from_directory=lambda **kw: FakeBuilder(eps))
@@ -409,27 +455,36 @@ def test_metadata_only_download_when_episodes_given(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(oxe, "_DATASET_CACHE", dict(_FAKE_CACHE), raising=False)
 
     tree_calls, meta_calls = [], []
+
+    def _fake_copy_metadata(src, dst):
+        meta_calls.append(src)
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / "dataset_info.json").write_text("{}")
+
     monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
-    monkeypatch.setattr(oxe, "_copy_metadata_only", lambda src, dst: meta_calls.append(src))
+    monkeypatch.setattr(oxe, "_copy_metadata_only", _fake_copy_metadata)
 
     oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
     assert tree_calls == [], "_copy_tree must not be called when episodes are specified"
     assert meta_calls == ["gs://gresearch/robotics/droid/1.0.1"]
 
+    # Second init with same episodes — no GCS calls at all
+    meta_calls.clear()
+    oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1], root=str(tmp_path))
+    assert meta_calls == [], "_copy_metadata_only must not run on second init"
 
-def test_copy_tree_skipped_when_memmap_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Once the TED memmap is built, _copy_tree is never called again (metadata only)."""
+
+def test_copy_tree_skipped_when_all_episodes_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Once all episodes are cached, _copy_tree is never called again."""
     _patch(monkeypatch)
 
     tree_calls = []
     monkeypatch.setattr(oxe, "_copy_tree", lambda src, dst: tree_calls.append(src))
 
-    # First init builds the memmap
     oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    # Second init: memmap complete → no _copy_tree
     tree_calls.clear()
     oxe.OXEDataset(dataset_name="droid", split="train", root=str(tmp_path))
-    assert tree_calls == [], "_copy_tree must not run when TED memmap is already complete"
+    assert tree_calls == [], "_copy_tree must not run when all episodes are already cached"
 
 
 # ---------------------------------------------------------------------------

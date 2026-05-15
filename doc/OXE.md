@@ -21,6 +21,8 @@ For example in output I want to see, name: viola and versions [0.1.0]
 
 - Load tlds on episodes in previously specified episodes list or all episodes if episodes list is not given. Convert all those episodes into torchrl TED BaseDatasetExperienceReplay format in one go. They can be held in a suitable memmap according to guidlines provided by torchrl. Make use of torchrl storage libs effectively.
 
+- Try to avoid reloading wherever possible.
+
 - First convert tf tensor to numpy and then to torch tensor. Remember it has to efficient and memory safe.  Dont use or move to cuda or gpu device anywhere in the Dataset.
 
 - Modalitites can be different for different datasets, so we need to be able to handle that. Names of modalities and their shapes can be different for different datasets. Also there would be a modality with str type, that too should be part of the BaseDatasetExperienceReplay Episode or Batch. 

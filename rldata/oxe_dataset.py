@@ -17,7 +17,7 @@ from torchrl.data import ImmutableDatasetWriter, RandomSampler, SliceSampler, Te
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
-from rldata.oxe.memmap_builder import build_memmap, is_memmap_complete
+from rldata.oxe.memmap_builder import build_missing_episodes, is_episode_cached
 from rldata.oxe.utils import (
     ModalitySpec,
     flatten_structure,
@@ -332,25 +332,12 @@ class OXEDataset(BaseDatasetExperienceReplay):
         self.root = _get_cache_dir(root)
 
         # ------------------------------------------------------------------
-        # 1. Download — metadata always, shards only when needed
+        # 1. Sync metadata JSON files from GCS if not already present
         # ------------------------------------------------------------------
         local_dir = self._local_tfds_dir()
-        memmap_dir = self._memmap_dir()
-
-        # Always sync metadata JSON files from GCS so builder.info / builder.meta
-        # are always available and up-to-date regardless of other download state.
-        _copy_metadata_only(self.dataset_path, str(local_dir))
-
-        # For a full (non-filtered) dataset, also download the data shards.
-        # Skip if the TED memmap is already built — shards are no longer needed.
-        if not is_memmap_complete(memmap_dir) and episodes is None:
-            _copy_tree(self.dataset_path, str(local_dir))
-
-        # For episode-selective loading, point a builder at GCS so only the
-        # requested episodes are streamed during TED conversion — no shards cached.
-        gcs_builder = None
-        if not is_memmap_complete(memmap_dir) and episodes is not None:
-            gcs_builder = tfds.builder_from_directory(builder_dir=self.dataset_path)
+        info_file = local_dir / "dataset_info.json"
+        if not info_file.exists() or info_file.stat().st_size == 0:
+            _copy_metadata_only(self.dataset_path, str(local_dir))
 
         try:
             self.builder = tfds.builder_from_directory(builder_dir=str(local_dir))
@@ -362,28 +349,46 @@ class OXEDataset(BaseDatasetExperienceReplay):
             ) from error
 
         # ------------------------------------------------------------------
-        # 2. Build TED memmap if not already done
+        # 2. Determine which episodes to load; find what's missing from cache
         # ------------------------------------------------------------------
-        if not is_memmap_complete(memmap_dir):
-            # Use the GCS builder for episode-selective loading so only the
-            # requested episodes are transferred from the bucket.
-            build_memmap(
-                builder=gcs_builder if gcs_builder is not None else self.builder,
+        episodes_dir = self._episodes_dir()
+
+        if self.episodes is not None:
+            selected = sorted(self.episodes)
+        else:
+            selected = list(range(self._get_total_episodes()))
+
+        missing = [i for i in selected if not is_episode_cached(episodes_dir / str(i))]
+
+        # ------------------------------------------------------------------
+        # 3. Download and convert only missing episodes
+        # ------------------------------------------------------------------
+        if missing:
+            if self.episodes is not None:
+                # Episode-selective: stream missing episodes directly from GCS.
+                # No shard files are written locally.
+                builder_for_data = tfds.builder_from_directory(builder_dir=self.dataset_path)
+            else:
+                # Full dataset: download shards to local cache (idempotent),
+                # then read locally for conversion.
+                _copy_tree(self.dataset_path, str(local_dir))
+                builder_for_data = self.builder
+
+            build_missing_episodes(
+                builder=builder_for_data,
                 split=split,
-                memmap_dir=memmap_dir,
-                episodes=self.episodes,
+                episodes_dir=episodes_dir,
+                missing=missing,
                 tf_tensor_types=_TF_TENSOR_TYPES,
             )
 
         # ------------------------------------------------------------------
-        # 3. Load memmap into storage
+        # 4. Load per-episode memmaps and concatenate (lazy — no data copied)
         # ------------------------------------------------------------------
-        meta = json.loads((memmap_dir / "_complete.json").read_text())
-        n_steps = meta["n_steps"]
-        self._num_episodes: int = meta["n_episodes"]
-
-        td = TensorDict.load_memmap(str(memmap_dir / "tensors"))
-        storage = TensorStorage(td[:n_steps])
+        self._loaded_indices: List[int] = selected
+        episode_tds = [TensorDict.load_memmap(str(episodes_dir / str(i))) for i in selected]
+        combined_td = torch.cat(episode_tds)
+        storage = TensorStorage(combined_td)
 
         if slice_len is not None:
             num_slices = max(1, batch_size // slice_len)
@@ -409,8 +414,8 @@ class OXEDataset(BaseDatasetExperienceReplay):
 
     @property
     def data_path(self) -> Path:
-        """Path to the converted TED memmap for the current split."""
-        return self._memmap_dir() / "tensors"
+        """Per-episode TED memmap directory for the current split."""
+        return self._episodes_dir()
 
     @property
     def data_path_root(self) -> Path:
@@ -418,7 +423,8 @@ class OXEDataset(BaseDatasetExperienceReplay):
         return self._local_tfds_dir()
 
     def _is_downloaded(self) -> bool:
-        return is_memmap_complete(self._memmap_dir())
+        episodes_dir = self._episodes_dir()
+        return all(is_episode_cached(episodes_dir / str(i)) for i in self._loaded_indices)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -430,8 +436,22 @@ class OXEDataset(BaseDatasetExperienceReplay):
             d = d / self.version
         return d
 
-    def _memmap_dir(self) -> Path:
-        return self._local_tfds_dir() / "memmap"
+    def _episodes_dir(self) -> Path:
+        return self._local_tfds_dir() / "episodes" / self.split
+
+    def _get_total_episodes(self) -> int:
+        """Return total episode count for the current split from builder.info."""
+        if self.info is not None:
+            splits = getattr(self.info, "splits", {})
+            split_info = splits.get(self.split)
+            if split_info is not None:
+                count = getattr(split_info, "num_examples", None)
+                if count is not None:
+                    return int(count)
+        raise RuntimeError(
+            f"Cannot determine episode count for '{self.dataset_name}/{self.split}' "
+            "from builder.info. Pass an explicit episodes list."
+        )
 
     def _infer_modalities(self) -> Dict[str, Dict[str, Any]]:
         meta = getattr(self.builder, "meta", None)
@@ -464,7 +484,7 @@ class OXEDataset(BaseDatasetExperienceReplay):
     @property
     def num_episodes(self) -> int:
         """Number of episodes loaded into this dataset."""
-        return self._num_episodes
+        return len(self._loaded_indices)
 
     def get_modalities(self) -> Dict[str, Dict[str, Any]]:
         return dict(self.modalities)

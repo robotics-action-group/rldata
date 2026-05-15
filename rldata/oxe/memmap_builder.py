@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Set, Tuple
 
 import torch
 
@@ -13,68 +13,82 @@ try:
 except ImportError:
     _tqdm_cls = None  # type: ignore[assignment]
 
-_SENTINEL = "_complete.json"
+_EPISODE_SENTINEL = "_steps.json"
 
 
-def _progress(iterable, *, desc: str = "", unit: str = "it", total: Optional[int] = None):
-    if _tqdm_cls is not None:
-        return _tqdm_cls(iterable, desc=desc, unit=unit, total=total, leave=True, dynamic_ncols=True)
-    return iterable
+def is_episode_cached(episode_dir: Path) -> bool:
+    """Return True if this episode has already been converted and saved."""
+    return (episode_dir / _EPISODE_SENTINEL).exists()
 
 
-def is_memmap_complete(memmap_dir: Path) -> bool:
-    return (memmap_dir / _SENTINEL).exists()
-
-
-def build_memmap(
-    builder: Any,
-    split: str,
-    memmap_dir: Path,
-    episodes: Optional[List[int]],
+def _build_one_episode(
+    episode: Any,
+    global_idx: int,
+    episode_dir: Path,
     tf_tensor_types: Tuple[type, ...],
 ) -> int:
-    """Convert selected episodes from a TFDS builder to TED-format memmap storage.
+    """Convert one episode to TED steps and memmap it to episode_dir.
 
-    Steps from every selected episode are converted to TED TensorDicts and
-    stacked into a single TensorDict that is memory-mapped to ``memmap_dir``.
-    A sentinel file ``_complete.json`` is written on success.
+    Uses global_idx as traj_ids so episode identity is consistent across
+    different OXEDataset instances that may share the same cache.
 
-    Returns the total number of steps written.
+    Returns the number of steps written.
     """
+    steps = episode_to_ted_steps(episode, global_idx, tf_tensor_types)
+    if not steps:
+        return 0
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    td = torch.stack(steps)
+    td.memmap_(str(episode_dir))
+    n_steps = len(td)
+    (episode_dir / _EPISODE_SENTINEL).write_text(json.dumps({"n_steps": n_steps}))
+    return n_steps
+
+
+def build_missing_episodes(
+    builder: Any,
+    split: str,
+    episodes_dir: Path,
+    missing: List[int],
+    tf_tensor_types: Tuple[type, ...],
+) -> None:
+    """Convert and cache only the episodes in ``missing`` (global indices).
+
+    Streams the TFDS dataset once up to ``max(missing)``, skipping episodes
+    that are not requested.  Already-cached episodes in ``missing`` are also
+    skipped (safe to call if a previous run was interrupted mid-way).
+
+    Args:
+        builder: TFDS builder (local or GCS) to read episode data from.
+        split: Dataset split name (e.g. ``"train"``).
+        episodes_dir: Root directory for per-episode memmaps
+            (``~/.cache/rldata/oxe/{name}/episodes/{split}/``).
+        missing: Global episode indices that are not yet cached.
+        tf_tensor_types: TF tensor types tuple for conversion.
+    """
+    if not missing:
+        return
+
+    missing_set: Set[int] = set(missing)
+    max_idx = max(missing_set)
     dataset = builder.as_dataset(split=split, shuffle_files=False)
 
-    if episodes is not None:
-        selected = set(episodes)
-        max_idx = max(selected)
-        episode_iter = (
-            (global_idx, ep)
-            for global_idx, ep in enumerate(dataset)
-            if global_idx <= max_idx
-        )
-    else:
-        episode_iter = enumerate(dataset)
-
-    all_steps: list = []
-    n_episodes = 0
-
-    for global_idx, episode in _progress(episode_iter, desc="Converting episodes to TED", unit="ep"):
-        if episodes is not None and global_idx not in selected:
-            continue
-        steps = episode_to_ted_steps(episode, n_episodes, tf_tensor_types)
-        all_steps.extend(steps)
-        n_episodes += 1
-
-    if not all_steps:
-        raise ValueError("No steps found; check dataset name, split, and episodes filter.")
-
-    tensors_dir = memmap_dir / "tensors"
-    tensors_dir.mkdir(parents=True, exist_ok=True)
-
-    all_td = torch.stack(all_steps)  # TensorDict(batch_size=[N_steps])
-    all_td.memmap_(str(tensors_dir))
-
-    n_steps = len(all_td)
-    (memmap_dir / _SENTINEL).write_text(
-        json.dumps({"n_steps": n_steps, "n_episodes": n_episodes})
+    pbar = (
+        _tqdm_cls(total=len(missing_set), desc="Converting episodes to TED", unit="ep", dynamic_ncols=True)
+        if _tqdm_cls is not None
+        else None
     )
-    return n_steps
+
+    for global_idx, episode in enumerate(dataset):
+        if global_idx > max_idx:
+            break
+        if global_idx not in missing_set:
+            continue
+        episode_dir = episodes_dir / str(global_idx)
+        if not is_episode_cached(episode_dir):
+            _build_one_episode(episode, global_idx, episode_dir, tf_tensor_types)
+        if pbar is not None:
+            pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
