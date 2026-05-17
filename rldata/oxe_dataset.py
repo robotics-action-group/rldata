@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -12,9 +11,11 @@ except ImportError:
     _tqdm_cls = None  # type: ignore[assignment]
 
 from tensordict import TensorDict
-from torchrl.data import ImmutableDatasetWriter, RandomSampler, SliceSampler, TensorStorage
+from torchrl.data import ImmutableDatasetWriter, TensorStorage
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
+from rldata._common import _get_cache_dir
+from rldata.oxe.temporal_sampler import TemporalSampler
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
 from rldata.oxe.memmap_builder import (
     build_combined_storage,
@@ -47,21 +48,6 @@ OXE_BUCKET_URL = "gs://gresearch/robotics"
 
 _DATASET_CACHE: Optional[Dict[str, Dict[str, str]]] = None
 _TF_TENSOR_TYPES = (tf.Tensor,) if tf is not None else tuple()
-
-
-# ---------------------------------------------------------------------------
-# Cache directory
-# ---------------------------------------------------------------------------
-
-def _get_cache_dir(override: Optional[str] = None) -> Path:
-    """Return the root cache directory.
-
-    Priority: override argument → RLDATA_CACHE env var → ~/.cache/rldata
-    """
-    if override is not None:
-        return Path(override)
-    env = os.environ.get("RLDATA_CACHE")
-    return Path(env) if env else Path.home() / ".cache" / "rldata"
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +266,7 @@ class OXEDataset(BaseDatasetExperienceReplay):
                 "terminated":  Tensor([1], bool),
             }),
             "collector": TensorDict({
-                "traj_ids": Tensor(int64),        # episode index for SliceSampler
+                "episode_id": Tensor(int64),      # episode index
             }),
         })
 
@@ -303,8 +289,6 @@ class OXEDataset(BaseDatasetExperienceReplay):
         episodes: List of episode indices to include.  Only those episodes are
             converted; the full dataset is otherwise used.
         batch_size: Number of transitions returned by ``sample()``.
-        slice_len: If set, ``sample()`` returns contiguous sub-trajectories of
-            this length via ``SliceSampler``.
         root: Override cache root directory.
     """
 
@@ -315,8 +299,9 @@ class OXEDataset(BaseDatasetExperienceReplay):
         version: Optional[str] = None,
         episodes: Optional[List[int]] = None,
         batch_size: int = 32,
-        slice_len: Optional[int] = None,
         root: Optional[str] = None,
+        delta_timestamps: Optional[Dict[str, List[float]]] = None,
+        control_frequency: float = 10.0,
     ) -> None:
         dataset_name = dataset_name.strip("/")
 
@@ -398,20 +383,42 @@ class OXEDataset(BaseDatasetExperienceReplay):
         combined_td = TensorDict.load_memmap(str(combined_dir / "data"))
         storage = TensorStorage(combined_td)
 
-        if slice_len is not None:
-            num_slices = max(1, batch_size // slice_len)
-            sampler = SliceSampler(
-                slice_len=slice_len,
-                num_slices=num_slices,
-                traj_key=("collector", "traj_ids"),
-                end_key=("next", "done"),
-            )
-        else:
-            sampler = RandomSampler()
+        # ------------------------------------------------------------------
+        # 5. Temporal sampler — always active (compulsory per spec).
+        #    Built before super().__init__() so it can be passed as the
+        #    buffer's sampler and satisfy the Sampler ABC contract.
+        #
+        # Effective delta_timestamps:
+        #   • Start with {key: [0.0]} for every tensor modality (T=1, just
+        #     the anchor step).  This satisfies the "default is 0 for all
+        #     modalities" requirement.
+        #   • Caller-supplied delta_timestamps overrides per-key.
+        # Image modalities are identified by kind="image" so the sampler can
+        # permute them from on-disk HWC → CHW (channels first).
+        # ------------------------------------------------------------------
+        # Tensor modalities only (skip text / non-numeric leaves)
+        default_dt: Dict[str, List[float]] = {
+            path: [0.0]
+            for path, spec in self.modalities.items()
+            if spec.get("dtype") is not None and spec.get("kind") != "text"
+        }
+        # Caller-supplied values take precedence
+        effective_dt = {**default_dt, **(delta_timestamps or {})}
+
+        self._episode_starts: Dict[int, int]
+        self._episode_lengths: Dict[int, int]
+        self._episode_starts, self._episode_lengths = (
+            TemporalSampler.build_episode_index(combined_td)
+        )
+        self._temporal_sampler = TemporalSampler(
+            delta_timestamps=effective_dt,
+            control_frequency=control_frequency,
+            image_keys=self.image_keys,
+        )
 
         super().__init__(
             storage=storage,
-            sampler=sampler,
+            sampler=self._temporal_sampler,
             writer=ImmutableDatasetWriter(),
             batch_size=batch_size,
         )
@@ -498,6 +505,22 @@ class OXEDataset(BaseDatasetExperienceReplay):
         """Number of episodes loaded into this dataset."""
         return len(self._loaded_indices)
 
+    @property
+    def image_keys(self) -> frozenset:
+        """Tuple-path keys whose tensors are stored as HWC images.
+
+        Pass to :class:`TemporalSampler` when you want automatic HWC→CHW
+        permutation::
+
+            sampler = TemporalSampler(..., image_keys=dataset.image_keys)
+            dataset.set_sampler(sampler)
+        """
+        return frozenset(
+            tuple(path.split("/"))
+            for path, spec in self.modalities.items()
+            if spec.get("kind") == "image"
+        )
+
     def get_modalities(self) -> Dict[str, Dict[str, Any]]:
         return dict(self.modalities)
 
@@ -509,3 +532,25 @@ class OXEDataset(BaseDatasetExperienceReplay):
             "features": getattr(self.info, "features", {}),
             "splits": getattr(self.info, "splits", {}),
         }
+
+    def _sample(self, batch_size: int) -> Any:
+        batch = self._temporal_sampler(
+            self._storage._storage,
+            self._episode_starts,
+            self._episode_lengths,
+            batch_size,
+        )
+        return batch, {}
+
+    def set_sampler(self, sampler: "TemporalSampler") -> None:
+        """Replace the temporal sampler.
+
+        Can be called after construction to change ``delta_timestamps`` or
+        ``control_frequency`` without rebuilding the dataset.
+
+        Args:
+            sampler: A :class:`TemporalSampler` configured with the desired
+                ``delta_timestamps`` and ``control_frequency``.
+        """
+        self._temporal_sampler = sampler
+        self._sampler = sampler

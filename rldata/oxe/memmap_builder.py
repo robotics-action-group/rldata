@@ -31,7 +31,7 @@ def _build_one_episode(
 ) -> int:
     """Convert one episode to TED steps and memmap it to episode_dir.
 
-    Uses global_idx as traj_ids so episode identity is consistent across
+    Uses global_idx as episode_id so episode identity is consistent across
     different OXEDataset instances that may share the same cache.
 
     Returns the number of steps written.

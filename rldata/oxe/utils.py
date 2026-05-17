@@ -180,7 +180,7 @@ def episode_to_ted_steps(
     Each output TensorDict follows TorchRL TED convention:
         observation, action, done, terminated
         next/{observation, reward, done, terminated}
-        collector/traj_ids  (= episode_idx, used by SliceSampler)
+        collector/episode_id  (= episode_idx)
 
     For the terminal step, next/observation is a copy of the current observation.
     Missing reward / is_last / is_terminal fields default to 0 / positional / positional.
@@ -227,7 +227,7 @@ def episode_to_ted_steps(
                     "done": is_last,
                     "terminated": is_terminal,
                 },
-                "collector": {"traj_ids": traj_id},
+                "collector": {"episode_id": traj_id},
             }
         )
 

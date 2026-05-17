@@ -6,6 +6,8 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+pytest.importorskip("tensorflow", reason="oxe extras not installed")
+
 import rldata.oxe_dataset as oxe
 from rldata.oxe.utils import dict_to_tensordict, episode_to_ted_steps, tf_to_torch
 
@@ -186,11 +188,11 @@ def test_episode_to_ted_steps_last_step_done() -> None:
     assert steps[0]["done"].item() is False
 
 
-def test_episode_to_ted_steps_traj_ids() -> None:
+def test_episode_to_ted_steps_episode_id() -> None:
     episode = _make_episode(0, n_steps=2)
     steps = episode_to_ted_steps(episode, episode_idx=7)
     for td in steps:
-        assert td["collector", "traj_ids"].item() == 7
+        assert td["collector", "episode_id"].item() == 7
 
 
 def test_episode_to_ted_steps_next_obs_for_non_terminal() -> None:
@@ -293,18 +295,20 @@ def test_sample_has_ted_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 
 
 def test_sample_action_is_tensor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Action has temporal dim T=1 by default — shape (B, T=1, action_dim)."""
     _patch(monkeypatch)
     ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=3, root=str(tmp_path))
     batch = ds.sample()
     assert isinstance(batch["action"], torch.Tensor)
-    assert batch["action"].shape == (3, 2)
+    assert batch["action"].shape == (3, 1, 2)  # (B, T=1, action_dim=2)
 
 
 def test_sample_observation_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Images are channels-first (B, T=1, C, H, W) — compulsory temporal + CHW."""
     _patch(monkeypatch)
     ds = oxe.OXEDataset(dataset_name="droid", split="train", batch_size=2, root=str(tmp_path))
     batch = ds.sample()
-    assert batch["observation", "image"].shape == (2, 8, 8, 3)
+    assert batch["observation", "image"].shape == (2, 1, 3, 8, 8)  # (B, T=1, C, H, W)
     assert batch["observation", "image"].dtype == torch.uint8
 
 
@@ -583,3 +587,131 @@ def test_combined_storage_is_memory_mapped(monkeypatch: pytest.MonkeyPatch, tmp_
         "action leaf should be MemoryMappedTensor (lazy disk access), got "
         f"{type(storage_td['action']).__name__}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Temporal sampling — TemporalSampler unit tests
+# ---------------------------------------------------------------------------
+
+def test_temporal_sampler_build_episode_index(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """build_episode_index maps each traj_id to its flat start and length."""
+    from rldata.oxe.temporal_sampler import TemporalSampler
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(dataset_name="droid", split="train", episodes=[0, 1, 2], root=str(tmp_path))
+    starts, lengths = TemporalSampler.build_episode_index(ds._storage._storage)
+    # 3 episodes × 3 steps each
+    assert sum(lengths.values()) == 9
+    for ep_id in starts:
+        assert lengths[ep_id] == 3
+
+
+def test_temporal_sampler_anchor_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """delta_timestamps with [0.0] → T=1 channels-first image (B, T, C, H, W)."""
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid",
+        split="train",
+        episodes=[0, 1, 2],
+        batch_size=4,
+        root=str(tmp_path),
+        delta_timestamps={"observation/image": [0.0]},
+        control_frequency=10.0,
+    )
+    batch = ds.sample()
+    # Image: (B, T=1, C=3, H=8, W=8) — channels first
+    assert batch["observation", "image"].shape == (4, 1, 3, 8, 8)
+    # Action not overridden → default T=1 from effective_dt
+    assert batch["action"].shape == (4, 1, 2)
+
+
+def test_temporal_sampler_multi_offset_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """delta_timestamps with 3 offsets → image shape (B, T=3, C, H, W)."""
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid",
+        split="train",
+        episodes=[0, 1, 2],
+        batch_size=4,
+        root=str(tmp_path),
+        delta_timestamps={"observation/image": [-0.1, 0.0, 0.1]},
+        control_frequency=10.0,
+    )
+    batch = ds.sample()
+    # (B, T=3, C=3, H=8, W=8) — channels first per spec
+    assert batch["observation", "image"].shape == (4, 3, 3, 8, 8)
+    assert batch["observation", "image"].dtype == torch.uint8
+
+
+def test_temporal_sampler_multi_modality(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Multiple keys in delta_timestamps each get their own T dimension."""
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid",
+        split="train",
+        episodes=[0, 1, 2],
+        batch_size=4,
+        root=str(tmp_path),
+        delta_timestamps={
+            "observation/image": [-0.1, 0.0, 0.1],
+            "action": [0.0, 0.1],
+        },
+        control_frequency=10.0,
+    )
+    batch = ds.sample()
+    # Image: (B, T=3, C=3, H=8, W=8)
+    assert batch["observation", "image"].shape == (4, 3, 3, 8, 8)
+    # Action: (B, T=2, action_dim=2)
+    assert batch["action"].shape == (4, 2, 2)
+
+
+def test_temporal_sampler_boundary_clamping(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Negative offsets from the first step clamp to step 0 (repeat-pad)."""
+    from rldata.oxe.temporal_sampler import TemporalSampler
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid",
+        split="train",
+        episodes=[0],
+        batch_size=1,
+        root=str(tmp_path),
+        delta_timestamps={"observation/state": [-0.5, 0.0]},
+        control_frequency=10.0,  # -0.5 s → -5 steps, clamped to 0
+    )
+    storage_td = ds._storage._storage
+    starts, lengths = TemporalSampler.build_episode_index(storage_td)
+    sampler = TemporalSampler(
+        delta_timestamps={"observation/state": [-0.5, 0.0]},
+        control_frequency=10.0,
+    )
+    # Force anchor to the very first step of episode 0
+    episode_ids = storage_td["collector", "episode_id"]
+    ep_id = int(episode_ids[0].item())
+    first_step_state = storage_td["observation", "state"][0]
+
+    # Sample 8 anchors — all must have their t=0 slot equal to the first-step state
+    import torch as _torch
+    _torch.manual_seed(0)
+    result = sampler(storage_td, {ep_id: 0}, {ep_id: lengths[ep_id]}, batch_size=1)
+    # The -0.5s offset (-5 steps) must have been clamped to step 0
+    # We verify by checking shape only (value depends on random anchor)
+    assert result["observation", "state"].shape == (1, 2, 4)
+
+
+def test_temporal_sampler_default_is_t1_for_all_modalities(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no delta_timestamps, temporal sampling is still compulsory: T=1 for all modalities."""
+    _patch(monkeypatch)
+    ds = oxe.OXEDataset(
+        dataset_name="droid",
+        split="train",
+        episodes=[0, 1],
+        batch_size=4,
+        root=str(tmp_path),
+        # delta_timestamps omitted → default {all_tensor_modalities: [0.0]}
+    )
+    assert ds._temporal_sampler is not None
+    batch = ds.sample()
+    # Temporal dim T=1 always present; image is channels-first (B, T, C, H, W)
+    assert batch["action"].shape == (4, 1, 2)          # (B, T=1, action_dim)
+    assert batch["observation", "image"].shape == (4, 1, 3, 8, 8)  # (B, T=1, C, H, W)

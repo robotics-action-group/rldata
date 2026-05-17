@@ -1,6 +1,7 @@
 """Internal helpers for OXE dataset loading."""
 
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
+from rldata.oxe.temporal_sampler import TemporalSampler
 from rldata.oxe.utils import (
     ModalitySpec,
     flatten_structure,
@@ -21,4 +22,5 @@ __all__ = [
     "flatten_structure",
     "discover_dataset_versions",
     "discover_datasets_from_bucket",
+    "TemporalSampler",
 ]
