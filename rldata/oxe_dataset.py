@@ -411,12 +411,6 @@ class OXEDataset(BaseDatasetExperienceReplay):
         # Image modalities are identified by kind="image" so the sampler can
         # permute them from on-disk HWC → CHW (channels first).
         # ------------------------------------------------------------------
-        image_keys: frozenset = frozenset(
-            tuple(path.split("/"))
-            for path, spec in self.modalities.items()
-            if spec.get("kind") == "image"
-        )
-
         # Tensor modalities only (skip text / non-numeric leaves)
         default_dt: Dict[str, List[float]] = {
             path: [0.0]
@@ -431,10 +425,11 @@ class OXEDataset(BaseDatasetExperienceReplay):
         self._episode_starts, self._episode_lengths = (
             TemporalSampler.build_episode_index(combined_td)
         )
+        # image_keys intentionally left empty — callers set it via set_sampler()
+        # using dataset.image_keys if they want HWC→CHW permutation.
         self._temporal_sampler = TemporalSampler(
             delta_timestamps=effective_dt,
             control_frequency=control_frequency,
-            image_keys=image_keys,
         )
 
         super().__init__(
@@ -525,6 +520,22 @@ class OXEDataset(BaseDatasetExperienceReplay):
     def num_episodes(self) -> int:
         """Number of episodes loaded into this dataset."""
         return len(self._loaded_indices)
+
+    @property
+    def image_keys(self) -> frozenset:
+        """Tuple-path keys whose tensors are stored as HWC images.
+
+        Pass to :class:`TemporalSampler` when you want automatic HWC→CHW
+        permutation::
+
+            sampler = TemporalSampler(..., image_keys=dataset.image_keys)
+            dataset.set_sampler(sampler)
+        """
+        return frozenset(
+            tuple(path.split("/"))
+            for path, spec in self.modalities.items()
+            if spec.get("kind") == "image"
+        )
 
     def get_modalities(self) -> Dict[str, Dict[str, Any]]:
         return dict(self.modalities)
