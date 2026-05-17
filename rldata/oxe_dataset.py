@@ -12,7 +12,7 @@ except ImportError:
     _tqdm_cls = None  # type: ignore[assignment]
 
 from tensordict import TensorDict
-from torchrl.data import ImmutableDatasetWriter, RandomSampler, SliceSampler, TensorStorage
+from torchrl.data import ImmutableDatasetWriter, TensorStorage
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
 from rldata.oxe.temporal_sampler import TemporalSampler
@@ -281,7 +281,7 @@ class OXEDataset(BaseDatasetExperienceReplay):
                 "terminated":  Tensor([1], bool),
             }),
             "collector": TensorDict({
-                "traj_ids": Tensor(int64),        # episode index for SliceSampler
+                "episode_id": Tensor(int64),      # episode index
             }),
         })
 
@@ -304,8 +304,6 @@ class OXEDataset(BaseDatasetExperienceReplay):
         episodes: List of episode indices to include.  Only those episodes are
             converted; the full dataset is otherwise used.
         batch_size: Number of transitions returned by ``sample()``.
-        slice_len: If set, ``sample()`` returns contiguous sub-trajectories of
-            this length via ``SliceSampler``.
         root: Override cache root directory.
     """
 
@@ -316,7 +314,6 @@ class OXEDataset(BaseDatasetExperienceReplay):
         version: Optional[str] = None,
         episodes: Optional[List[int]] = None,
         batch_size: int = 32,
-        slice_len: Optional[int] = None,
         root: Optional[str] = None,
         delta_timestamps: Optional[Dict[str, List[float]]] = None,
         control_frequency: float = 10.0,
@@ -401,26 +398,10 @@ class OXEDataset(BaseDatasetExperienceReplay):
         combined_td = TensorDict.load_memmap(str(combined_dir / "data"))
         storage = TensorStorage(combined_td)
 
-        if slice_len is not None:
-            num_slices = max(1, batch_size // slice_len)
-            sampler = SliceSampler(
-                slice_len=slice_len,
-                num_slices=num_slices,
-                traj_key=("collector", "traj_ids"),
-                end_key=("next", "done"),
-            )
-        else:
-            sampler = RandomSampler()
-
-        super().__init__(
-            storage=storage,
-            sampler=sampler,
-            writer=ImmutableDatasetWriter(),
-            batch_size=batch_size,
-        )
-
         # ------------------------------------------------------------------
         # 5. Temporal sampler — always active (compulsory per spec).
+        #    Built before super().__init__() so it can be passed as the
+        #    buffer's sampler and satisfy the Sampler ABC contract.
         #
         # Effective delta_timestamps:
         #   • Start with {key: [0.0]} for every tensor modality (T=1, just
@@ -454,6 +435,13 @@ class OXEDataset(BaseDatasetExperienceReplay):
             delta_timestamps=effective_dt,
             control_frequency=control_frequency,
             image_keys=image_keys,
+        )
+
+        super().__init__(
+            storage=storage,
+            sampler=self._temporal_sampler,
+            writer=ImmutableDatasetWriter(),
+            batch_size=batch_size,
         )
 
     # ------------------------------------------------------------------
@@ -550,19 +538,24 @@ class OXEDataset(BaseDatasetExperienceReplay):
             "splits": getattr(self.info, "splits", {}),
         }
 
-    def sample(self, batch_size: Optional[int] = None) -> Any:
-        """Sample a temporally-structured batch.
-
-        All tensor modalities have a temporal dimension T:
-        - Modalities in ``delta_timestamps`` get T = len(delta_timestamps[key]).
-        - All other tensor modalities default to T=1 (anchor step only).
-        - Image modalities are returned channels-first: ``(B, T, C, H, W)``.
-        - All other modalities: ``(B, T, ...)``.
-        """
-        bs = batch_size if batch_size is not None else self.batch_size
-        return self._temporal_sampler(
+    def _sample(self, batch_size: int) -> Any:
+        batch = self._temporal_sampler(
             self._storage._storage,
             self._episode_starts,
             self._episode_lengths,
-            bs,
+            batch_size,
         )
+        return batch, {}
+
+    def set_sampler(self, sampler: "TemporalSampler") -> None:
+        """Replace the temporal sampler.
+
+        Can be called after construction to change ``delta_timestamps`` or
+        ``control_frequency`` without rebuilding the dataset.
+
+        Args:
+            sampler: A :class:`TemporalSampler` configured with the desired
+                ``delta_timestamps`` and ``control_frequency``.
+        """
+        self._temporal_sampler = sampler
+        self._sampler = sampler

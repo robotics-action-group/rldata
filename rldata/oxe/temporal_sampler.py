@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, FrozenSet, List, Tuple
 
 import torch
 from tensordict import TensorDict
+from torchrl.data.replay_buffers.samplers import Sampler
+from torchrl.data.replay_buffers.storages import Storage
 
 
-class TemporalSampler:
+class TemporalSampler(Sampler):
     """Samples temporally-structured batches from a flat TED storage.
 
     Every modality listed in ``delta_timestamps`` is gathered at the specified
@@ -42,6 +45,45 @@ class TemporalSampler:
         }
 
     # ------------------------------------------------------------------
+    # Sampler ABC
+    # ------------------------------------------------------------------
+
+    @property
+    def ran_out(self) -> bool:
+        return False
+
+    def sample(self, storage: Storage, batch_size: int) -> Tuple[TensorDict, dict]:
+        """Temporal sample called by ReplayBuffer machinery.
+
+        Builds the episode index from ``storage`` on-the-fly and returns the
+        full temporal batch rather than flat indices.  ``OXEDataset._sample``
+        calls ``__call__`` directly with a pre-cached index for efficiency;
+        this method exists so that a ``TemporalSampler`` can also be dropped
+        into a plain ``ReplayBuffer``.
+        """
+        storage_td: TensorDict = getattr(storage, "_storage", storage)
+        starts, lengths = self.build_episode_index(storage_td)
+        return self(storage_td, starts, lengths, batch_size), {}
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "delta_timestamps": self.delta_timestamps,
+            "control_frequency": self.control_frequency,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        pass
+
+    def _empty(self) -> None:
+        pass
+
+    def dumps(self, path: Any) -> None:
+        pass
+
+    def loads(self, path: Any) -> None:
+        pass
+
+    # ------------------------------------------------------------------
     # Episode index helpers
     # ------------------------------------------------------------------
 
@@ -49,17 +91,17 @@ class TemporalSampler:
     def build_episode_index(
         storage_td: TensorDict,
     ) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Build per-episode start/length maps from ``collector/traj_ids``.
+        """Build per-episode start/length maps from ``collector/episode_id``.
 
         Assumes episodes are stored contiguously (guaranteed by
         ``build_combined_storage``).
 
         Returns:
-            episode_starts:  {traj_id: first_flat_index}
-            episode_lengths: {traj_id: number_of_steps}
+            episode_starts:  {episode_id: first_flat_index}
+            episode_lengths: {episode_id: number_of_steps}
         """
-        traj_ids: torch.Tensor = storage_td["collector", "traj_ids"]
-        unique_ids, counts = torch.unique_consecutive(traj_ids, return_counts=True)
+        episode_ids: torch.Tensor = storage_td["collector", "episode_id"]
+        unique_ids, counts = torch.unique_consecutive(episode_ids, return_counts=True)
         starts = torch.zeros_like(counts)
         starts[1:] = counts[:-1].cumsum(0)
         episode_starts = {int(tid): int(s) for tid, s in zip(unique_ids, starts)}
@@ -89,15 +131,15 @@ class TemporalSampler:
 
         Args:
             storage_td: Flat TED TensorDict of shape ``(total_steps,)``.
-            episode_starts: {traj_id: first_flat_index}
-            episode_lengths: {traj_id: number_of_steps}
+            episode_starts: {episode_id: first_flat_index}
+            episode_lengths: {episode_id: number_of_steps}
             batch_size: Number of anchor steps to sample.
 
         Returns:
             TensorDict with ``batch_size=[batch_size]``.
         """
         total_steps = storage_td.batch_size[0]
-        traj_ids = storage_td["collector", "traj_ids"]
+        episode_ids = storage_td["collector", "episode_id"]
 
         # Sample B anchor flat indices uniformly
         anchor_indices = torch.randint(0, total_steps, (batch_size,))
@@ -108,7 +150,7 @@ class TemporalSampler:
             T = len(offsets)
             idx = torch.zeros(batch_size, T, dtype=torch.long)
             for b, anchor in enumerate(anchor_indices.tolist()):
-                tid = int(traj_ids[anchor].item())
+                tid = int(episode_ids[anchor].item())
                 ep_start = episode_starts[tid]
                 ep_len = episode_lengths[tid]
                 step = anchor - ep_start

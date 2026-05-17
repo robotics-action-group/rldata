@@ -9,13 +9,14 @@ from rldata.oxe_dataset import (
     dataset2path,
     list_datasets,
     validate_dataset_name,
+    TemporalSampler
 )
-
 __all__ = [
     'OXEDataset',
     'dataset2path',
     'list_datasets',
     'validate_dataset_name',
+    'TemporalSampler'
 ]
 
 __version__ = '0.1.0'

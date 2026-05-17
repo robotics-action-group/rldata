@@ -186,11 +186,11 @@ def test_episode_to_ted_steps_last_step_done() -> None:
     assert steps[0]["done"].item() is False
 
 
-def test_episode_to_ted_steps_traj_ids() -> None:
+def test_episode_to_ted_steps_episode_id() -> None:
     episode = _make_episode(0, n_steps=2)
     steps = episode_to_ted_steps(episode, episode_idx=7)
     for td in steps:
-        assert td["collector", "traj_ids"].item() == 7
+        assert td["collector", "episode_id"].item() == 7
 
 
 def test_episode_to_ted_steps_next_obs_for_non_terminal() -> None:
@@ -682,8 +682,8 @@ def test_temporal_sampler_boundary_clamping(monkeypatch: pytest.MonkeyPatch, tmp
         control_frequency=10.0,
     )
     # Force anchor to the very first step of episode 0
-    traj_ids = storage_td["collector", "traj_ids"]
-    ep_id = int(traj_ids[0].item())
+    episode_ids = storage_td["collector", "episode_id"]
+    ep_id = int(episode_ids[0].item())
     first_step_state = storage_td["observation", "state"][0]
 
     # Sample 8 anchors — all must have their t=0 slot equal to the first-step state
