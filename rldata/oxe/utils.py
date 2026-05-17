@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -139,3 +139,105 @@ def flatten_structure(
         source="metadata" if prefix else "sample",
     )
     return flattened
+
+
+def dict_to_tensordict(data: Dict[str, Any]) -> "TensorDict":
+    """Convert a nested dict of torch tensors to a TensorDict (batch_size=[]).
+
+    Tensor leaves become regular TensorDict fields.  String/non-tensor leaves
+    are stored via set_non_tensor so they survive round-trips without coercion.
+    Nested dicts become nested TensorDicts.
+    """
+    from tensordict import TensorDict
+
+    tensors: Dict[str, Any] = {}
+    non_tensors: Dict[str, Any] = {}
+
+    for key, val in data.items():
+        if isinstance(val, torch.Tensor):
+            tensors[key] = val
+        elif isinstance(val, dict):
+            tensors[key] = dict_to_tensordict(val)
+        else:
+            non_tensors[key] = val
+
+    td = TensorDict(tensors, batch_size=[])
+    for key, val in non_tensors.items():
+        td.set_non_tensor(key, val)
+    return td
+
+
+def episode_to_ted_steps(
+    episode: Any,
+    episode_idx: int,
+    tf_tensor_types: Tuple[type, ...] = (),
+) -> List["TensorDict"]:
+    """Convert one TFDS episode to a list of TED-format TensorDicts (one per step).
+
+    Handles both TFDS OXE format (episode has a "steps" key whose value is an
+    iterable of step dicts) and flat format (episode dict is itself one step).
+
+    Each output TensorDict follows TorchRL TED convention:
+        observation, action, done, terminated
+        next/{observation, reward, done, terminated}
+        collector/traj_ids  (= episode_idx, used by SliceSampler)
+
+    For the terminal step, next/observation is a copy of the current observation.
+    Missing reward / is_last / is_terminal fields default to 0 / positional / positional.
+    """
+    # Collect raw steps
+    if "steps" in episode:
+        raw = list(episode["steps"])
+    else:
+        raw = [episode]
+
+    # Convert all steps to Python/torch in one shot
+    steps = [tf_to_torch(s, tf_tensor_types) for s in raw]
+    T = len(steps)
+
+    traj_id = torch.tensor(episode_idx, dtype=torch.int64)
+    ted_steps: List[Any] = []
+
+    for t, step in enumerate(steps):
+        is_last_val = step.get("is_last", t == T - 1)
+        is_terminal_val = step.get("is_terminal", is_last_val)
+        # Ensure bool scalars regardless of whether the source was a tensor or bool
+        is_last = torch.as_tensor(is_last_val, dtype=torch.bool).view(1)
+        is_terminal = torch.as_tensor(is_terminal_val, dtype=torch.bool).view(1)
+
+        reward_raw = step.get("reward", 0.0)
+        reward = torch.as_tensor(
+            reward_raw.item() if isinstance(reward_raw, torch.Tensor) else float(reward_raw),
+            dtype=torch.float32,
+        ).view(1)
+
+        next_step = steps[t + 1] if t < T - 1 else step
+        obs = step.get("observation", {})
+        next_obs = next_step.get("observation", {})
+
+        td = dict_to_tensordict(
+            {
+                "observation": obs if isinstance(obs, dict) else {"obs": obs},
+                "action": step.get("action", torch.zeros(1)),
+                "done": is_last,
+                "terminated": is_terminal,
+                "next": {
+                    "observation": next_obs if isinstance(next_obs, dict) else {"obs": next_obs},
+                    "reward": reward,
+                    "done": is_last,
+                    "terminated": is_terminal,
+                },
+                "collector": {"traj_ids": traj_id},
+            }
+        )
+
+        # Pass through any extra string/non-tensor fields (e.g. language_instruction)
+        for key, val in step.items():
+            if key not in {"observation", "action", "reward", "is_last", "is_terminal",
+                           "is_first", "discount", "steps"}:
+                if not isinstance(val, (torch.Tensor, dict)):
+                    td.set_non_tensor(key, val if not isinstance(val, bytes) else val.decode("utf-8"))
+
+        ted_steps.append(td)
+
+    return ted_steps

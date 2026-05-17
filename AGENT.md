@@ -1,5 +1,5 @@
 This is a collections of Dataset libraries for loading robot learning datasets. 
-The objective to support to multiple sources of data and load them into torch Dataset
+The objective to support to multiple sources of data and load them into torchrl TED format.
 
 Features,
 
