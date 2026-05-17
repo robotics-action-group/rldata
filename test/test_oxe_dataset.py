@@ -6,6 +6,8 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+pytest.importorskip("tensorflow", reason="oxe extras not installed")
+
 import rldata.oxe_dataset as oxe
 from rldata.oxe.utils import dict_to_tensordict, episode_to_ted_steps, tf_to_torch
 

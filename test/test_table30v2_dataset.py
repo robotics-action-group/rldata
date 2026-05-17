@@ -5,6 +5,8 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+pytest.importorskip("datasets", reason="hf extras not installed")
+
 import rldata.table30v2_dataset as t30
 from rldata.hf.loader import hf_episode_to_oxe_format, _convert_leaf, _to_nested, filter_by_tasks
 
