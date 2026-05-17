@@ -31,7 +31,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: 
+      name: pypi
+      url: "https://pypi.org/manage/project/robotdataset/"
     permissions:
       id-token: write
 
@@ -44,3 +46,7 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          package-dir: dist/
+
+
