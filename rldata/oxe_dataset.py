@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -15,6 +14,7 @@ from tensordict import TensorDict
 from torchrl.data import ImmutableDatasetWriter, TensorStorage
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
+from rldata._common import _get_cache_dir
 from rldata.oxe.temporal_sampler import TemporalSampler
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
 from rldata.oxe.memmap_builder import (
@@ -48,21 +48,6 @@ OXE_BUCKET_URL = "gs://gresearch/robotics"
 
 _DATASET_CACHE: Optional[Dict[str, Dict[str, str]]] = None
 _TF_TENSOR_TYPES = (tf.Tensor,) if tf is not None else tuple()
-
-
-# ---------------------------------------------------------------------------
-# Cache directory
-# ---------------------------------------------------------------------------
-
-def _get_cache_dir(override: Optional[str] = None) -> Path:
-    """Return the root cache directory.
-
-    Priority: override argument → RLDATA_CACHE env var → ~/.cache/rldata
-    """
-    if override is not None:
-        return Path(override)
-    env = os.environ.get("RLDATA_CACHE")
-    return Path(env) if env else Path.home() / ".cache" / "rldata"
 
 
 # ---------------------------------------------------------------------------
@@ -425,11 +410,10 @@ class OXEDataset(BaseDatasetExperienceReplay):
         self._episode_starts, self._episode_lengths = (
             TemporalSampler.build_episode_index(combined_td)
         )
-        # image_keys intentionally left empty — callers set it via set_sampler()
-        # using dataset.image_keys if they want HWC→CHW permutation.
         self._temporal_sampler = TemporalSampler(
             delta_timestamps=effective_dt,
             control_frequency=control_frequency,
+            image_keys=self.image_keys,
         )
 
         super().__init__(
