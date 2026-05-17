@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from torchrl.data import ImmutableDatasetWriter, RandomSampler, SliceSampler, TensorStorage
 from torchrl.data.datasets.common import BaseDatasetExperienceReplay
 
+from rldata.oxe.temporal_sampler import TemporalSampler
 from rldata.oxe.bucket import discover_dataset_versions, discover_datasets_from_bucket
 from rldata.oxe.memmap_builder import (
     build_combined_storage,
@@ -317,6 +318,8 @@ class OXEDataset(BaseDatasetExperienceReplay):
         batch_size: int = 32,
         slice_len: Optional[int] = None,
         root: Optional[str] = None,
+        delta_timestamps: Optional[Dict[str, List[float]]] = None,
+        control_frequency: float = 10.0,
     ) -> None:
         dataset_name = dataset_name.strip("/")
 
@@ -416,6 +419,43 @@ class OXEDataset(BaseDatasetExperienceReplay):
             batch_size=batch_size,
         )
 
+        # ------------------------------------------------------------------
+        # 5. Temporal sampler — always active (compulsory per spec).
+        #
+        # Effective delta_timestamps:
+        #   • Start with {key: [0.0]} for every tensor modality (T=1, just
+        #     the anchor step).  This satisfies the "default is 0 for all
+        #     modalities" requirement.
+        #   • Caller-supplied delta_timestamps overrides per-key.
+        # Image modalities are identified by kind="image" so the sampler can
+        # permute them from on-disk HWC → CHW (channels first).
+        # ------------------------------------------------------------------
+        image_keys: frozenset = frozenset(
+            tuple(path.split("/"))
+            for path, spec in self.modalities.items()
+            if spec.get("kind") == "image"
+        )
+
+        # Tensor modalities only (skip text / non-numeric leaves)
+        default_dt: Dict[str, List[float]] = {
+            path: [0.0]
+            for path, spec in self.modalities.items()
+            if spec.get("dtype") is not None and spec.get("kind") != "text"
+        }
+        # Caller-supplied values take precedence
+        effective_dt = {**default_dt, **(delta_timestamps or {})}
+
+        self._episode_starts: Dict[int, int]
+        self._episode_lengths: Dict[int, int]
+        self._episode_starts, self._episode_lengths = (
+            TemporalSampler.build_episode_index(combined_td)
+        )
+        self._temporal_sampler = TemporalSampler(
+            delta_timestamps=effective_dt,
+            control_frequency=control_frequency,
+            image_keys=image_keys,
+        )
+
     # ------------------------------------------------------------------
     # BaseDatasetExperienceReplay abstract interface
     # ------------------------------------------------------------------
@@ -509,3 +549,20 @@ class OXEDataset(BaseDatasetExperienceReplay):
             "features": getattr(self.info, "features", {}),
             "splits": getattr(self.info, "splits", {}),
         }
+
+    def sample(self, batch_size: Optional[int] = None) -> Any:
+        """Sample a temporally-structured batch.
+
+        All tensor modalities have a temporal dimension T:
+        - Modalities in ``delta_timestamps`` get T = len(delta_timestamps[key]).
+        - All other tensor modalities default to T=1 (anchor step only).
+        - Image modalities are returned channels-first: ``(B, T, C, H, W)``.
+        - All other modalities: ``(B, T, ...)``.
+        """
+        bs = batch_size if batch_size is not None else self.batch_size
+        return self._temporal_sampler(
+            self._storage._storage,
+            self._episode_starts,
+            self._episode_lengths,
+            bs,
+        )
