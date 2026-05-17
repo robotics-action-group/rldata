@@ -31,7 +31,7 @@ dependencies = [
     "torch>=1.13.1",
     "torchrl>=0.2.0",
     "tqdm>=4.64.0",
-    "imageio[ffmpeg]"
+    "imageio[ffmpeg]",
 ]
 
 [project.optional-dependencies]
